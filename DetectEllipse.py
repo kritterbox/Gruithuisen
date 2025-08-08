@@ -59,26 +59,10 @@ def detect_and_normalize_circle_ellipse(image_path):
     # Step 2: Check if ellipse refinement is needed by measuring the actual solar disk boundary
     ellipse_params = analyze_solar_disk_shape(image, x_circle, y_circle, r_circle)
     
-    if ellipse_params is not None:
-        center, axes, angle = ellipse_params
-        aspect_ratio = max(axes) / min(axes)
-        print(f"Ellipse detected: Center=({center[0]:.1f}, {center[1]:.1f}), "
-              f"Axes=({axes[0]:.1f}, {axes[1]:.1f}), Angle={angle:.1f}°")
-        print(f"Aspect ratio: {aspect_ratio:.3f}")
-        
-        # Only use ellipse if it's a significant improvement and makes sense
-        if aspect_ratio > 1.02 and aspect_ratio < 1.5:  # 2% minimum difference, max 50% elongation
-            print(f"Using ellipse refinement (aspect ratio: {aspect_ratio:.3f})")
-            use_ellipse = True
-            ellipse = ellipse_params
-        else:
-            print(f"Ellipse not significant enough (aspect ratio: {aspect_ratio:.3f}), using circle")
-            use_ellipse = False
-            ellipse = ((x_circle, y_circle), (2*r_circle, 2*r_circle), 0)
-    else:
-        print("No ellipse detected, using original circle")
-        use_ellipse = False
-        ellipse = ((x_circle, y_circle), (2*r_circle, 2*r_circle), 0)
+    # FIXED: Improved decision logic between circle and ellipse
+    use_ellipse, ellipse = improved_ellipse_vs_circle_decision(
+        image, x_circle, y_circle, r_circle, ellipse_params
+    )
     
     # Step 3: Extract and normalize the solar disk
     center, axes, angle = ellipse
@@ -169,6 +153,179 @@ def detect_and_normalize_circle_ellipse(image_path):
     plt.show()
     
     return final_disk, final_center, effective_radius
+
+
+def improved_ellipse_vs_circle_decision(image, x_circle, y_circle, r_circle, ellipse_params):
+    """
+    FIXED: Improved decision logic to choose between circle and ellipse based on actual fit quality.
+    """
+    if ellipse_params is None:
+        print("No ellipse detected, using circle")
+        return False, ((x_circle, y_circle), (2*r_circle, 2*r_circle), 0)
+    
+    center, axes, angle = ellipse_params
+    aspect_ratio = max(axes) / min(axes)
+    
+    print(f"Circle: Center=({x_circle}, {y_circle}), Radius={r_circle}")
+    print(f"Ellipse: Center=({center[0]:.1f}, {center[1]:.1f}), "
+          f"Axes=({axes[0]:.1f}, {axes[1]:.1f}), Angle={angle:.1f}°")
+    print(f"Aspect ratio: {aspect_ratio:.3f}")
+    
+    # Step 1: Reject ellipses that are too elongated for a solar disk
+    if aspect_ratio > 1.25:  # Solar disks shouldn't be this elongated
+        print(f"Ellipse rejected: too elongated (aspect ratio {aspect_ratio:.3f} > 1.25)")
+        return False, ((x_circle, y_circle), (2*r_circle, 2*r_circle), 0)
+    
+    # Step 2: If aspect ratio is very close to 1, prefer the circle (simpler)
+    if aspect_ratio < 1.05:  # Less than 5% difference
+        print(f"Using circle: ellipse not significantly different (aspect ratio {aspect_ratio:.3f} < 1.05)")
+        return False, ((x_circle, y_circle), (2*r_circle, 2*r_circle), 0)
+    
+    # Step 3: Compare actual fit quality by sampling the boundary
+    circle_fit_score = evaluate_circle_fit(image, x_circle, y_circle, r_circle)
+    ellipse_fit_score = evaluate_ellipse_fit(image, ellipse_params)
+    
+    print(f"Fit quality scores: Circle={circle_fit_score:.3f}, Ellipse={ellipse_fit_score:.3f}")
+    
+    # Step 4: Only use ellipse if it's significantly better AND reasonably shaped
+    improvement_threshold = 0.15  # Ellipse must be 15% better to be chosen
+    
+    if (ellipse_fit_score > circle_fit_score + improvement_threshold and 
+        aspect_ratio <= 1.2 and  # Reasonable shape
+        aspect_ratio >= 1.05):   # Significant difference
+        
+        print(f"Using ellipse: significantly better fit (improvement: {ellipse_fit_score - circle_fit_score:.3f})")
+        return True, ellipse_params
+    else:
+        print(f"Using circle: better or equivalent fit")
+        return False, ((x_circle, y_circle), (2*r_circle, 2*r_circle), 0)
+
+
+def evaluate_circle_fit(image, cx, cy, radius):
+    """
+    Evaluate how well a circle fits the actual solar disk boundary.
+    Returns a score between 0 and 1 (higher = better fit).
+    """
+    num_samples = 36  # Every 10 degrees
+    angles = np.linspace(0, 2*np.pi, num_samples, endpoint=False)
+    
+    boundary_distances = []
+    
+    for angle in angles:
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+        
+        # Find the actual boundary along this ray
+        actual_boundary = find_boundary_along_ray_improved(image, cx, cy, cos_a, sin_a, radius)
+        
+        if actual_boundary is not None:
+            # Compare with expected circle distance
+            error = abs(actual_boundary - radius) / radius
+            boundary_distances.append(1.0 - min(error, 1.0))  # Convert error to score
+    
+    if len(boundary_distances) > num_samples * 0.7:  # At least 70% valid samples
+        return np.mean(boundary_distances)
+    else:
+        return 0.0
+
+
+def evaluate_ellipse_fit(image, ellipse_params):
+    """
+    Evaluate how well an ellipse fits the actual solar disk boundary.
+    Returns a score between 0 and 1 (higher = better fit).
+    """
+    center, axes, angle = ellipse_params
+    cx, cy = center
+    a, b = axes[0] / 2, axes[1] / 2  # Semi-axes
+    angle_rad = np.radians(angle)
+    
+    num_samples = 36  # Every 10 degrees
+    angles = np.linspace(0, 2*np.pi, num_samples, endpoint=False)
+    
+    boundary_distances = []
+    
+    for theta in angles:
+        # Calculate expected distance for ellipse at this angle
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        
+        # Transform to ellipse coordinate system
+        x_dir = cos_t * np.cos(angle_rad) + sin_t * np.sin(angle_rad)
+        y_dir = -cos_t * np.sin(angle_rad) + sin_t * np.cos(angle_rad)
+        
+        # Calculate distance from center to ellipse boundary
+        if a > 0 and b > 0:
+            expected_distance = (a * b) / np.sqrt((b * x_dir)**2 + (a * y_dir)**2)
+        else:
+            continue
+        
+        # Find actual boundary
+        actual_boundary = find_boundary_along_ray_improved(image, cx, cy, cos_t, sin_t, expected_distance)
+        
+        if actual_boundary is not None:
+            # Compare with expected ellipse distance
+            error = abs(actual_boundary - expected_distance) / expected_distance
+            boundary_distances.append(1.0 - min(error, 1.0))  # Convert error to score
+    
+    if len(boundary_distances) > num_samples * 0.7:  # At least 70% valid samples
+        return np.mean(boundary_distances)
+    else:
+        return 0.0
+
+
+def find_boundary_along_ray_improved(image, cx, cy, cos_a, sin_a, expected_radius):
+    """
+    Improved boundary detection along a ray from the center.
+    """
+    # Search range around expected radius
+    start_r = max(expected_radius * 0.8, 20)
+    end_r = min(expected_radius * 1.2, min(image.shape) // 2 - 5)
+    
+    if start_r >= end_r:
+        return None
+    
+    # Sample points along the ray
+    test_radii = np.linspace(start_r, end_r, 40)
+    intensities = []
+    
+    for r in test_radii:
+        x = cx + r * cos_a
+        y = cy + r * sin_a
+        
+        # Check bounds
+        if 2 <= x <= image.shape[1] - 3 and 2 <= y <= image.shape[0] - 3:
+            # Sample a small area for stability
+            x_int, y_int = int(x), int(y)
+            intensity = np.mean(image[y_int-1:y_int+2, x_int-1:x_int+2])
+            intensities.append(intensity)
+        else:
+            return None
+    
+    if len(intensities) < 10:
+        return None
+    
+    # Find the boundary using gradient analysis
+    try:
+        from scipy.ndimage import gaussian_filter1d
+        smoothed = gaussian_filter1d(intensities, sigma=1.0)
+        gradients = np.gradient(smoothed)
+        
+        # Find the strongest positive gradient (transition from dark space to bright disk)
+        positive_gradients = np.where(gradients > 0)[0]
+        
+        if len(positive_gradients) > 0:
+            max_grad_idx = positive_gradients[np.argmax(gradients[positive_gradients])]
+            if max_grad_idx < len(test_radii):
+                return test_radii[max_grad_idx]
+    except ImportError:
+        # Fallback without scipy
+        pass
+    
+    # Simple fallback: find median crossing
+    median_intensity = np.median(intensities)
+    for i, intensity in enumerate(intensities):
+        if intensity > median_intensity:
+            return test_radii[i]
+    
+    return None
 
 
 def analyze_solar_disk_shape(image, cx, cy, radius):
